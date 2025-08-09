@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Wasm mem benchmark</title>
+<pre id="out"></pre>
+<script type="module">
+
+  const out = document.getElementById('out');
+  const log = (...a) => out.textContent += a.join(' ') + '\n';
+  const iters = 200_000_000;   // tune as needed
+  const warmup = 1_000_000;
+
+  function nsPerCall(ms, n) { return (ms * 1e6) / n; }
+
+  function importLibBase(value) {
+    return { env: { lib_base: new WebAssembly.Global({ value: 'i32', mutable: false }, value | 0) } };
+  }
+
+  async function instantiate(url, imports) {
+    const resp = await fetch(url);
+    try {
+      return (await WebAssembly.instantiateStreaming(resp, imports)).instance;
+    } catch {
+      const buf = await resp.arrayBuffer();
+      return (await WebAssembly.instantiate(buf, imports)).instance;
+    }
+  }
+
+  function initMem(mem, VAR, STORE) {
+    // Fill mem[base .. base+count*8) with 64-bit values
+    const u32 = new Uint32Array(mem.buffer);
+    u32[VAR] = 0x9e3779b9;
+    u32[STORE] = 0x7f4a7c15;
+  }
+
+  function time(fn) {
+    const t0 = performance.now();
+    const out = fn();
+    const t1 = performance.now();
+    return { ms: t1 - t0, out };
+  }
+
+  // Pick one of the two .wasm files you compiled:
+  const wasmUrl = 'mem_bench.wasm';
+
+  const libBase = 0;        // start of region
+  const STORE_OFFSET = 64;      // matches the WAT (CONST = 64)
+  const VAR_OFFSET = 0;        // matches the WAT (CONST = 0)
+
+
+  const inst = await instantiate(wasmUrl, importLibBase(libBase));
+  const mem = inst.exports.mem;
+
+  initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET);
+
+  // Warm up
+  if (inst.exports.bench_prebuilt_imm) inst.exports.bench_prebuilt_imm(warmup);
+  inst.exports.bench_prebuilt_mut(warmup);
+  inst.exports.bench_local(warmup);
+  inst.exports.bench_global_each(warmup);
+  // Measure and formatted output
+  const benchmarks = [
+    { key: 'A', name: 'const offsets', fn: () => { initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET); return inst.exports.bench_const(iters); } },
+    { key: 'B', name: 'local init each-iter', fn: () => { initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET); return inst.exports.bench_local(iters); } },
+    { key: 'C', name: 'global each-iter', fn: () => { initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET); return inst.exports.bench_global_each(iters); } },
+    { key: 'D', name: 'prebuilt MUT (start)', fn: () => { initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET); return inst.exports.bench_prebuilt_mut(iters); } },
+    { key: 'E', name: 'prebuilt IMM (ext-const)', fn: () => { initMem(mem, libBase + VAR_OFFSET, libBase + STORE_OFFSET); return inst.exports.bench_prebuilt_imm(iters); } },
+  ];
+
+  const header = [
+    'Benchmark'.padEnd(30),
+    'Time (ns/call)'.padStart(14),
+    'Result'.padStart(10)
+  ].join(' | ');
+  log(header);
+  log('-'.repeat(header.length));
+
+  benchmarks.forEach(({ key, name, fn }) => {
+    const { ms, out } = time(fn);
+    const avg = nsPerCall(ms, iters).toFixed(2).padStart(14);
+    const res = String(out).padStart(10);
+    log(`${key}) ${name.padEnd(26)} |${avg} |${res}`);
+  });
+</script>
