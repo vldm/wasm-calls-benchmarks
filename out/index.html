@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Wasm call benchmark</title>
+<pre id="out"></pre>
+<script type="module">
+    const out = document.getElementById('out');
+    const log = (...a) => out.textContent += a.join(' ') + '\n';
+
+    const iters = 20_000_000;   // tune up/down based on device
+    const warmup = 1_000_000;
+
+    function nsPerCall(ms, n) { return (ms * 1e6) / n; }
+
+    async function loadWasm(url, imports) {
+        const resp = await fetch(url);
+        return WebAssembly.instantiateStreaming(resp, imports ?? {});
+    }
+
+    (async () => {
+        // Load provider
+        const { instance: A } = await loadWasm('provider.wasm');
+
+        // 1) Direct import: call_export -> env.foo = A.exports.foo
+        const { instance: C_direct } = await loadWasm('call_export.wasm', {
+            env: { foo: A.exports.foo }
+        });
+
+        // 2) JS trampoline: call_export -> env.foo_stub = (...)->A.exports.foo
+        const foo_stub = (x) => A.exports.foo(x);
+        const { instance: C_js } = await loadWasm('call_export.wasm', {
+            env: { foo: foo_stub }
+        });
+
+        // 2) JS trampoline: call_export -> env.foo_stub = (...)->A.exports.foo
+        const foo_stub_spread = (...args) => A.exports.foo(...args);
+        const { instance: C_js_spread } = await loadWasm('call_export.wasm', {
+            env: { foo: foo_stub_spread }
+        });
+
+        // 2) JS trampoline (but created as js object with _set method):
+        // This avoid usage of shared variable A.
+        // But introduces a mutable state in the js object itself.
+        // call_export -> env.foo_stub = (...)->A.exports.foo
+        const build_foo = () => {
+            let impl = (x) => { throw new Error("Dependency not loaded. Call linker.ensure(...) first."); };
+            const fn = (x) => impl(x);
+            fn._set = (real) => { impl = real; };
+            return fn;
+        };
+        let foo_stub_mutable = build_foo();
+        const { instance: C_js_mutable } = await loadWasm('call_export.wasm', {
+            env: { foo: foo_stub_mutable }
+        });
+        foo_stub_mutable._set(A.exports.foo);
+
+
+        // 3) call_indirect (table from wasm): call_indirect -> env.table, slot 0 = A.exports.foo
+        const { instance: C_ind } = await loadWasm('call_indirect.wasm', {
+            env: { table: A.exports.table }
+        });
+
+        // 4) call_indirect_stub: call -> call_indirect -> env.table, slot 0 = A.exports.foo
+        const { instance: C_ind_stub } = await loadWasm('call_indirect_stub.wasm', {
+            env: { table: A.exports.table }
+        });
+
+        // 5) call_indirect (new table from js): call_indirect -> env.table, slot 0 = A.exports.foo
+        // anyfunc instead of funcref because chrome does not support funcref as of (v 139)
+        const table = new WebAssembly.Table({ initial: 1, element: 'anyfunc' });
+        table.set(0, A.exports.foo);
+        const { instance: C_ind_js_table } = await loadWasm('call_indirect.wasm', {
+            env: { table }
+        });
+
+        // --- Warmup ---
+        C_direct.exports.bench(warmup);
+        C_js.exports.bench(warmup);
+        C_js_mutable.exports.bench(warmup);
+        C_ind.exports.bench(warmup);
+        C_ind_stub.exports.bench(warmup);
+        C_ind_js_table.exports.bench(warmup);
+
+        // --- Measure ---
+        function time(fn) {
+            const t0 = performance.now();
+            const acc = fn();
+            const t1 = performance.now();
+            return { ms: (t1 - t0), acc };
+        }
+
+        const methods = [
+            ['Direct import', C_direct],
+            ['JS trampoline', C_js],
+            ['JS trampoline (spread)', C_js_spread],
+            ['JS trampoline (mutable)', C_js_mutable],
+            ['call_indirect', C_ind],
+            ['call_indirect (js table)', C_ind_js_table],
+            ['call_indirect_stub', C_ind_stub],
+        ];
+
+        for (const [label, inst] of methods) {
+            const r = time(() => inst.exports.bench(iters));
+            const timeStr = nsPerCall(r.ms, iters).toFixed(2);
+            log(label.padEnd(28) + timeStr.padEnd(6) + 'ns/call' + `(acc=${r.acc})`.padStart(22));
+        }
+
+        log('\nNote: lower is better.');
+
+
+        
+
+    })();
+</script>
